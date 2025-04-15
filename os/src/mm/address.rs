@@ -227,6 +227,14 @@ where
     pub fn get_end(&self) -> T {
         self.r
     }
+
+    pub fn overlaps(&self, b: &Self) -> bool {
+        !(self.r <= b.l || self.l >= b.r)
+    }
+
+    pub fn equal(&self, b: &Self) -> bool {
+        self.r == b.r && self.l == b.l
+    }
 }
 impl<T> IntoIterator for SimpleRange<T>
 where

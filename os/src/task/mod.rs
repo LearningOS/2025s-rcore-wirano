@@ -15,6 +15,7 @@ mod switch;
 mod task;
 
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::MapPermission;
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
@@ -153,6 +154,50 @@ impl TaskManager {
             panic!("All applications completed!");
         }
     }
+
+    fn trace_syscall(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].syscall_cnt[syscall_id] += 1;
+    }
+
+    fn get_syscall_cnt(&self, syscall_id: usize) -> isize {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].syscall_cnt[syscall_id]
+    }
+
+    fn mmap(&self, start: usize, len: usize, port: usize) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        let current_task = &mut inner.tasks[current];
+
+        let port = MapPermission::from_bits(((port as u8) << 1) | 0x10).unwrap();
+
+        if current_task
+            .memory_set
+            .mmap(start.into(), (start + len).into(), port)
+        {
+            0
+        } else {
+            -1
+        }
+    }
+
+    fn munmap(&self, start: usize, len: usize) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        let current_task = &mut inner.tasks[current];
+
+        if current_task
+            .memory_set
+            .munmap(start.into(), (start + len).into())
+        {
+            0
+        } else {
+            -1
+        }
+    }
 }
 
 /// Run the first task in task list.
@@ -201,4 +246,24 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// trace syscall and counting
+pub fn trace_syscall(syscall_id: usize) {
+    TASK_MANAGER.trace_syscall(syscall_id);
+}
+
+/// get syscall cnt
+pub fn get_syscall_cnt(syscall_id: usize) -> isize {
+    TASK_MANAGER.get_syscall_cnt(syscall_id)
+}
+
+/// mmap
+pub fn mmap(start: usize, len: usize, port: usize) -> isize {
+    TASK_MANAGER.mmap(start, len, port)
+}
+
+/// munmap
+pub fn munmap(start: usize, len: usize) -> isize {
+    TASK_MANAGER.munmap(start, len)
 }

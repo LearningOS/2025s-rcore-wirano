@@ -300,6 +300,35 @@ impl MemorySet {
             false
         }
     }
+
+    /// mmap
+    pub fn mmap(&mut self, start: VirtAddr, end: VirtAddr, perm: MapPermission) -> bool {
+        let mmap_range = VPNRange::new(start.floor(), end.ceil());
+
+        for area in &self.areas {
+            if mmap_range.overlaps(&area.vpn_range) {
+                return false;
+            }
+        }
+
+        self.insert_framed_area(start, end, perm);
+        true
+    }
+
+    /// munmap
+    pub fn munmap(&mut self, start: VirtAddr, end: VirtAddr) -> bool {
+        let mmap_range = VPNRange::new(start.floor(), end.ceil());
+
+        for (idx, area) in self.areas.iter_mut().enumerate() {
+            if mmap_range.equal(&area.vpn_range) {
+                area.unmap(&mut self.page_table);
+                self.areas.remove(idx);
+                return true;
+            }
+        }
+
+        false
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {

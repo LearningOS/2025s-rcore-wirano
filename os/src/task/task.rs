@@ -8,6 +8,8 @@ use crate::trap::{trap_handler, TrapContext};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::RefMut;
+use core::cmp::Ordering;
+use core::ops::AddAssign;
 
 /// Task control block structure
 ///
@@ -21,7 +23,7 @@ pub struct TaskControlBlock {
     pub kernel_stack: KernelStack,
 
     /// Mutable
-    inner: UPSafeCell<TaskControlBlockInner>,
+    pub inner: UPSafeCell<TaskControlBlockInner>,
 }
 
 impl TaskControlBlock {
@@ -36,6 +38,7 @@ impl TaskControlBlock {
     }
 }
 
+/// Task Contorol Block Inner
 pub struct TaskControlBlockInner {
     /// The physical page number of the frame where the trap context is placed
     pub trap_cx_ppn: PhysPageNum,
@@ -68,6 +71,12 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// stride
+    pub stride: Stride,
+
+    /// priority
+    pub prio: usize,
 }
 
 impl TaskControlBlockInner {
@@ -82,6 +91,7 @@ impl TaskControlBlockInner {
     fn get_status(&self) -> TaskStatus {
         self.task_status
     }
+    /// is process zonbie
     pub fn is_zombie(&self) -> bool {
         self.get_status() == TaskStatus::Zombie
     }
@@ -118,6 +128,8 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    stride: Stride(0),
+                    prio: 16,
                 })
             },
         };
@@ -191,6 +203,8 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    stride: Stride(0),
+                    prio: 16,
                 })
             },
         });
@@ -249,4 +263,26 @@ pub enum TaskStatus {
     Running,
     /// exited
     Zombie,
+}
+
+#[derive(Copy, Clone, Debug)]
+/// task stride
+pub struct Stride(pub u64);
+
+impl AddAssign for Stride {
+    fn add_assign(&mut self, other: Self) {
+        *self = Self(self.0 + other.0)
+    }
+}
+
+impl PartialOrd for Stride {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some((self.0 as i64).cmp(&(other.0 as i64)))
+    }
+}
+
+impl PartialEq for Stride {
+    fn eq(&self, _other: &Self) -> bool {
+        false
+    }
 }

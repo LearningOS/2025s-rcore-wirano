@@ -1,13 +1,22 @@
 //! Process management syscalls
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
+use core::mem::size_of;
 
 use crate::{
+    config::{PAGE_SIZE, TRAP_CONTEXT_BASE},
     loader::get_app_data_by_name,
-    mm::{translated_refmut, translated_str},
-    task::{
-        add_task, current_task, current_user_token, exit_current_and_run_next,
-        suspend_current_and_run_next,
+    mm::{
+        translated_byte_buffer, translated_refmut, translated_str, MapPermission, MemorySet,
+        VirtAddr, KERNEL_SPACE,
     },
+    sync::UPSafeCell,
+    task::{
+        add_task, current_task, current_user_token, exit_current_and_run_next, kstack_alloc,
+        pid_alloc, suspend_current_and_run_next, Stride, TaskContext, TaskControlBlock,
+        TaskControlBlockInner, TaskStatus,
+    },
+    timer::get_time_us,
+    trap::{trap_handler, TrapContext},
 };
 
 #[repr(C)]
@@ -67,7 +76,11 @@ pub fn sys_exec(path: *const u8) -> isize {
 /// If there is not a child process whose pid is same as given, return -1.
 /// Else if there is a child process but it is still running, return -2.
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
-    trace!("kernel::pid[{}] sys_waitpid [{}]", current_task().unwrap().pid.0, pid);
+    trace!(
+        "kernel::pid[{}] sys_waitpid [{}]",
+        current_task().unwrap().pid.0,
+        pid
+    );
     let task = current_task().unwrap();
     // find a child process
 
@@ -105,30 +118,63 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
 /// YOUR JOB: get time with second and microsecond
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    trace!("kernel:pid[{}] sys_get_time", current_task().unwrap().pid.0);
+
+    let current_token = current_task().unwrap().get_user_token();
+    let ts_in_kernel = translated_byte_buffer(current_token, ts as *const u8, size_of::<TimeVal>());
+    let ts_ptr = ts_in_kernel[0].as_ptr() as *mut TimeVal;
+    let us = get_time_us();
+    unsafe {
+        (*ts_ptr).sec = us / 1_000_000;
+        (*ts_ptr).usec = us % 1_000_000;
+    }
+    0
 }
 
 /// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
+    trace!("kernel:pid[{}] sys_mmap", current_task().unwrap().pid.0);
+    if start % PAGE_SIZE != 0 || port & !0x7 != 0 || port & 0x7 == 0 {
+        return -1;
+    }
+
+    // align to page size
+    if start & 0xfff != 0 {
+        return -1;
+    }
+
+    let end = VirtAddr::from(start + len);
+    let start = VirtAddr::from(start);
+    let perm = MapPermission::from_bits_truncate((port as u8) << 1) | MapPermission::U;
+
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+
+    match inner.memory_set.mmap(start, end, perm) {
+        true => 0,
+        false => -1,
+    }
 }
 
 /// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    trace!("kernel:pid[{}] sys_munmap", current_task().unwrap().pid.0);
+    // align to page size
+    if start & 0xfff != 0 {
+        return -1;
+    }
+
+    let end = VirtAddr::from(start + len);
+    let start = VirtAddr::from(start);
+
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+
+    match inner.memory_set.munmap(start, end) {
+        true => 0,
+        false => -1,
+    }
 }
 
 /// change data segment size
@@ -143,19 +189,84 @@ pub fn sys_sbrk(size: i32) -> isize {
 
 /// YOUR JOB: Implement spawn.
 /// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
+pub fn sys_spawn(path: *const u8) -> isize {
+    trace!("kernel:pid[{}] sys_spawn", current_task().unwrap().pid.0);
+
+    let task = match current_task() {
+        Some(t) => t,
+        None => return -1,
+    };
+    // ---- access parent PCB exclusively
+    let mut parent_inner = task.inner_exclusive_access();
+
+    let path = translated_str(parent_inner.get_user_token(), path);
+    let elf_data = match get_app_data_by_name(path.as_str()) {
+        Some(elf) => elf,
+        None => return -1,
+    };
+
+    let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+    let trap_cx_ppn = memory_set
+        .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
+        .unwrap()
+        .ppn();
+
+    // alloc a pid and a kernel stack in kernel space
+    let pid_handle = pid_alloc();
+    let kernel_stack = kstack_alloc();
+    let kernel_stack_top = kernel_stack.get_top();
+    let task_control_block = Arc::new(TaskControlBlock {
+        pid: pid_handle,
+        kernel_stack,
+        inner: unsafe {
+            UPSafeCell::new(TaskControlBlockInner {
+                trap_cx_ppn,
+                base_size: parent_inner.base_size,
+                task_cx: TaskContext::goto_trap_return(kernel_stack_top),
+                task_status: TaskStatus::Ready,
+                memory_set,
+                parent: Some(Arc::downgrade(&task)),
+                children: Vec::new(),
+                exit_code: 0,
+                heap_bottom: parent_inner.heap_bottom,
+                program_brk: parent_inner.program_brk,
+                stride: Stride(0),
+                prio: 16,
+            })
+        },
+    });
+    // add child
+    parent_inner.children.push(task_control_block.clone());
+    // modify kernel_sp in trap_cx
+    // **** access child PCB exclusively
+    let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
+    *trap_cx = TrapContext::app_init_context(
+        entry_point,
+        user_sp,
+        KERNEL_SPACE.exclusive_access().token(),
+        kernel_stack_top,
+        trap_handler as usize,
     );
-    -1
+
+    let pid = task_control_block.pid.0 as isize;
+    add_task(task_control_block);
+    pid
 }
 
 // YOUR JOB: Set task priority.
-pub fn sys_set_priority(_prio: isize) -> isize {
+pub fn sys_set_priority(prio: isize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_set_priority",
         current_task().unwrap().pid.0
     );
-    -1
+
+    if prio < 2 {
+        return -1;
+    }
+
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+
+    inner.prio = prio as usize;
+    prio
 }
